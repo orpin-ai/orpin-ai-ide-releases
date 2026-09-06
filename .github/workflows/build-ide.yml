@@ -167,7 +167,7 @@ jobs:
       - name: Windows build dependencies
         if: matrix.os_name == 'windows'
         shell: bash
-        run: choco install jq rsync -y --no-progress || true
+        run: choco install jq -y --no-progress
 
       - name: Put the overlay into the checkout
         shell: bash
