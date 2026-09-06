@@ -1,0 +1,280 @@
+# Builds the ORPIN AI IDE from its private source and publishes the binaries
+# here, in the public downloads repository.
+#
+# Why here and not in the source repository: GitHub gives a public
+# repository's workflows 4-core, 16 GB runners for free, while a private
+# repository's standard runners have 2 cores and 7 GB — and a VS Code build
+# needs more than 7 GB at the bundling step (both attempts from the private
+# repository ended with "the hosted runner lost communication with the
+# server"). The source stays private: this workflow checks it out with a
+# read-only token, and only the built artefacts end up in a release. Logs of
+# a run are public, as with any public repository; they show file names and
+# build output, never file contents.
+#
+# Manual by design (workflow_dispatch): a full build of VS Code takes about
+# an hour per platform, macOS runners are billed at ten times the Linux
+# rate, and a release is a decision, not a side effect of a push.
+#
+# Signing is optional and driven by secrets. Without them the artefacts are
+# unsigned: macOS shows "unidentified developer" (right-click → Open once)
+# and Windows shows SmartScreen. With them, macOS builds are Developer ID
+# signed and notarised, and Windows builds are Authenticode signed. The
+# release notes say which it was. Nothing here ever claims a build is
+# signed when it is not.
+#
+# Required secret:
+#   SOURCE_TOKEN  a fine-grained token with Contents: read on
+#                 orpin-ai/orpin-ai-ide (the private source). Nothing else.
+# Optional secrets for signing:
+#   macOS:   CERTIFICATE_OSX_P12_DATA (base64 .p12), CERTIFICATE_OSX_P12_PASSWORD,
+#            CERTIFICATE_OSX_APPLE_ID, CERTIFICATE_OSX_APP_PASSWORD, CERTIFICATE_OSX_TEAM_ID
+#   Windows: SIGNPATH_API_TOKEN, SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_POLICY_SLUG
+#
+# The workflow in the source repository documents the same recipe and is
+# kept in step with this one; this is the one that runs.
+name: Build and release the IDE
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Comma-separated: macos-arm64, macos-x64, windows-x64, windows-arm64, linux-x64, linux-arm64"
+        default: "macos-arm64,macos-x64,windows-x64,linux-x64"
+      publish:
+        description: "Create/update the GitHub Release (false = artefacts only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  # The identity every VSCodium script reads (utils.sh defaults these to
+  # VSCodium's own values; dev/build-orpin.sh sets the same five).
+  APP_NAME: ORPIN
+  BINARY_NAME: orpin
+  ORG_NAME: orpin-ai
+  GH_REPO_PATH: orpin-ai/orpin-ai-ide
+  ASSETS_REPOSITORY: orpin-ai/orpin-ai-ide
+  VSCODE_QUALITY: stable
+  CI_BUILD: "no"
+  SHOULD_BUILD: "yes"
+  SHOULD_BUILD_REH: "no"
+  SHOULD_BUILD_REH_WEB: "no"
+  SKIP_ASSETS: "no"
+
+jobs:
+  pins:
+    name: Read the lock
+    runs-on: ubuntu-latest
+    outputs:
+      vscodium_commit: ${{ steps.lock.outputs.vscodium_commit }}
+      vscode_tag: ${{ steps.lock.outputs.vscode_tag }}
+      release_version: ${{ steps.lock.outputs.release_version }}
+      source_sha: ${{ steps.lock.outputs.source_sha }}
+      matrix: ${{ steps.lock.outputs.matrix }}
+    steps:
+      - name: The source token must be present
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          [[ -n "$SOURCE_TOKEN" ]] || { echo "::error::SOURCE_TOKEN is not set: a fine-grained token with Contents: read on orpin-ai/orpin-ai-ide. Nothing was built."; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: orpin-ai/orpin-ai-ide
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - id: lock
+        shell: bash
+        run: |
+          echo "vscodium_commit=$(jq -r .vscodium.commit upstream.lock.json)" >> "$GITHUB_OUTPUT"
+          echo "vscode_tag=$(jq -r .vscode.tag upstream.lock.json)" >> "$GITHUB_OUTPUT"
+          echo "release_version=$(jq -r .release_version upstream.lock.json)" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # The requested platforms, as a matrix of (runner, os_name, arch).
+          want="${{ github.event.inputs.platforms }}"
+          python3 - "$want" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          rows = {
+            "macos-arm64":   {"runner": "macos-14",     "os_name": "osx",     "arch": "arm64"},
+            "macos-x64":     {"runner": "macos-13",     "os_name": "osx",     "arch": "x64"},
+            "windows-x64":   {"runner": "windows-2022", "os_name": "windows", "arch": "x64"},
+            "windows-arm64": {"runner": "windows-2022", "os_name": "windows", "arch": "arm64"},
+            "linux-x64":     {"runner": "ubuntu-22.04", "os_name": "linux",   "arch": "x64"},
+            "linux-arm64":   {"runner": "ubuntu-22.04", "os_name": "linux",   "arch": "arm64"},
+          }
+          want = [w.strip() for w in sys.argv[1].split(",") if w.strip()]
+          unknown = [w for w in want if w not in rows]
+          if unknown: raise SystemExit(f"unknown platform(s): {unknown}")
+          print("matrix=" + json.dumps({"include": [dict(name=w, **rows[w]) for w in want]}))
+          PY
+
+  build:
+    name: ${{ matrix.name }}
+    needs: pins
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.pins.outputs.matrix) }}
+    env:
+      OS_NAME: ${{ matrix.os_name }}
+      VSCODE_ARCH: ${{ matrix.arch }}
+      RELEASE_VERSION: ${{ needs.pins.outputs.release_version }}
+      # product.commit in the app. VS Code's build prefers this to the vscode
+      # tree's HEAD, which here is a baseline commit made on the runner and
+      # says nothing about ORPIN's code. The overlay commit is what a build
+      # is a build of, and the update feed compares it.
+      BUILD_SOURCEVERSION: ${{ needs.pins.outputs.source_sha }}
+    steps:
+      - name: The source token must be present
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          [[ -n "$SOURCE_TOKEN" ]] || { echo "::error::SOURCE_TOKEN is not set: a fine-grained token with Contents: read on orpin-ai/orpin-ai-ide. Nothing was built."; exit 1; }
+      - name: Overlay (the private source)
+        uses: actions/checkout@v4
+        with:
+          repository: orpin-ai/orpin-ai-ide
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: overlay
+
+      - name: VSCodium at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: orpin-ai/vscodium
+          ref: ${{ needs.pins.outputs.vscodium_commit }}
+          path: vscodium
+
+      - name: Python (node-gyp)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Linux build dependencies
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential g++ libx11-dev libxkbfile-dev libsecret-1-dev libkrb5-dev fakeroot rpm jq rsync
+      # The compiler VSCodium builds its Linux binaries with, so the native
+      # modules link against the same glibc range its packages do.
+      - name: GCC 10 (Linux native modules)
+        if: matrix.os_name == 'linux' && matrix.arch == 'x64'
+        uses: egor-tensin/setup-gcc@v1
+        with:
+          version: 10
+          platform: x64
+      - name: Windows build dependencies
+        if: matrix.os_name == 'windows'
+        shell: bash
+        run: choco install jq rsync -y --no-progress || true
+
+      - name: Put the overlay into the checkout
+        shell: bash
+        env:
+          ORPIN_VSCODIUM_CHECKOUT: ${{ github.workspace }}/vscodium
+        run: overlay/dev/sync-overlay.sh
+
+      - name: Fetch VS Code ${{ needs.pins.outputs.vscode_tag }}
+        shell: bash
+        working-directory: vscodium
+        run: ./get_repo.sh
+
+      # After the fetch, so the Node version is the one this VS Code's
+      # .nvmrc asks for (its preinstall check refuses any other major).
+      - name: Node, as VS Code pins it
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: vscodium/vscode/.nvmrc
+
+      # The first run of this workflow died with "the hosted runner lost
+      # communication with the server": build.sh also builds the remote
+      # extension host and its web variant unless told not to, and three
+      # VS Code builds on one runner starve it. VSCodium's own workflow sets
+      # these two for its compile job; so does this one. The swap file is
+      # the second guard: the minify step peaks above what the runner has.
+      - name: Room to build (swap, and the toolchains this build never uses)
+        if: matrix.os_name == 'linux'
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+          free -h; df -h /
+      - name: Build
+        shell: bash
+        working-directory: vscodium
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npm_config_arch: ${{ matrix.arch }}
+          SHOULD_BUILD_REH: "no"
+          SHOULD_BUILD_REH_WEB: "no"
+        run: ./build.sh
+
+      - name: Package (signs and notarises only when the secrets are present)
+        shell: bash
+        working-directory: vscodium
+        env:
+          CERTIFICATE_OSX_P12_DATA: ${{ secrets.CERTIFICATE_OSX_P12_DATA }}
+          CERTIFICATE_OSX_P12_PASSWORD: ${{ secrets.CERTIFICATE_OSX_P12_PASSWORD }}
+          CERTIFICATE_OSX_APPLE_ID: ${{ secrets.CERTIFICATE_OSX_APPLE_ID }}
+          CERTIFICATE_OSX_APP_PASSWORD: ${{ secrets.CERTIFICATE_OSX_APP_PASSWORD }}
+          CERTIFICATE_OSX_TEAM_ID: ${{ secrets.CERTIFICATE_OSX_TEAM_ID }}
+        run: ./prepare_assets.sh
+
+      - name: Record whether this artefact is signed
+        shell: bash
+        working-directory: vscodium
+        run: |
+          signed=unsigned
+          [[ "${{ matrix.os_name }}" == "osx" && -n "${{ secrets.CERTIFICATE_OSX_P12_DATA }}" ]] && signed=signed-notarised
+          echo "$signed" > "assets/SIGNING-${{ matrix.name }}.txt"
+          # The build's identity, so the update feed can tell a running app
+          # whether it is this build: product.commit in the app is this sha.
+          echo "${{ needs.pins.outputs.source_sha }}" > "assets/COMMIT-${{ matrix.name }}.txt"
+          ls -la assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ide-${{ matrix.name }}
+          path: vscodium/assets/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: [pins, build]
+    if: ${{ github.event.inputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Release notes that say what these builds are
+        shell: bash
+        run: |
+          v="${{ needs.pins.outputs.release_version }}"
+          {
+            echo "ORPIN AI IDE ${v} — VS Code ${{ needs.pins.outputs.vscode_tag }} with VSCodium's stack (${{ needs.pins.outputs.vscodium_commit }}) and the ORPIN overlay (${{ needs.pins.outputs.source_sha }})."
+            echo
+            echo "| Artefact | Signing |"; echo "|---|---|"
+            for f in assets/SIGNING-*.txt; do n="${f#assets/SIGNING-}"; echo "| ${n%.txt} | $(cat "$f") |"; done
+            echo
+            echo "Build commit: \`$(cat assets/COMMIT-*.txt | sort -u | head -1)\` (product.commit in the app; the update feed compares it)."
+            echo
+            echo "Unsigned macOS builds: right-click the app → Open the first time, or run \`xattr -dr com.apple.quarantine \"/Applications/ORPIN AI IDE.app\"\`. Unsigned Windows builds show a SmartScreen warning."
+          } > notes.md
+          rm -f assets/SIGNING-*.txt assets/COMMIT-*.txt
+      # This repository is the download channel, so the release lands here
+      # with the workflow's own token.
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          v="${{ needs.pins.outputs.release_version }}"
+          if gh release view "$v" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$v" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$v" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            gh release create "$v" assets/* --repo "$GITHUB_REPOSITORY" --title "ORPIN AI IDE $v" --prerelease --notes-file notes.md
+          fi
