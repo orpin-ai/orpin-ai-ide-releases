@@ -227,6 +227,12 @@ jobs:
           CI_BUILD: "yes"
           SHOULD_BUILD_REH: "no"
           SHOULD_BUILD_REH_WEB: "no"
+          # Windows ships the zip and the two Inno Setup installers. VSCodium's
+          # WiX template hardcodes VSCODIUM.EXE, so the MSI cannot be built for
+          # a product whose executable is orpin.exe until that template is
+          # made ours; the first Windows run failed on exactly that.
+          SHOULD_BUILD_MSI: "no"
+          SHOULD_BUILD_MSI_NOUP: "no"
           CERTIFICATE_OSX_P12_DATA: ${{ secrets.CERTIFICATE_OSX_P12_DATA }}
           CERTIFICATE_OSX_P12_PASSWORD: ${{ secrets.CERTIFICATE_OSX_P12_PASSWORD }}
           CERTIFICATE_OSX_APPLE_ID: ${{ secrets.CERTIFICATE_OSX_APPLE_ID }}
