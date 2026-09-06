@@ -213,15 +213,18 @@ jobs:
       # CI_BUILD is "no" for build.sh so it packages in this same job (in
       # VSCodium's CI a second, containerised job does that), but "no" also
       # makes the Linux asset script source stores/snapcraft/build.sh, a
-      # file VSCodium does not ship (its snap is built by its own job), and
-      # on macOS it would re-run the packing. So the asset step runs with
-      # CI_BUILD unset. The remote extension host was not built, so its
+      # file VSCodium does not ship (its snap is built by its own job); on
+      # macOS "no" only redirects the signing keychain to TMPDIR, which is
+      # for local runs. So the asset step runs with CI_BUILD "yes" — an
+      # empty value would not do: Actions treats an empty step env as unset
+      # and the job's "no" would show through, which is what the fourth
+      # attempt proved. The remote extension host was not built, so its
       # archives are not asked for either.
       - name: Package (signs and notarises only when the secrets are present)
         shell: bash
         working-directory: vscodium
         env:
-          CI_BUILD: ""
+          CI_BUILD: "yes"
           SHOULD_BUILD_REH: "no"
           SHOULD_BUILD_REH_WEB: "no"
           CERTIFICATE_OSX_P12_DATA: ${{ secrets.CERTIFICATE_OSX_P12_DATA }}
