@@ -97,7 +97,7 @@ jobs:
           import json, sys
           rows = {
             "macos-arm64":   {"runner": "macos-14",     "os_name": "osx",     "arch": "arm64"},
-            "macos-x64":     {"runner": "macos-13",     "os_name": "osx",     "arch": "x64"},
+            "macos-x64":     {"runner": "macos-15-intel", "os_name": "osx",   "arch": "x64"},
             "windows-x64":   {"runner": "windows-2022", "os_name": "windows", "arch": "x64"},
             "windows-arm64": {"runner": "windows-2022", "os_name": "windows", "arch": "arm64"},
             "linux-x64":     {"runner": "ubuntu-22.04", "os_name": "linux",   "arch": "x64"},
